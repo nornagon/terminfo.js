@@ -1,10 +1,11 @@
 const {Parser} = require('binary-parser')
+const {EventEmitter} = require('events')
 const fs = require('fs')
 const path = require('path')
 
 function untilEven() { return offset % 2 === 0 ? 0 : 1 }
 
-const TerminfoParser = new Parser()
+const TermInfoParser = new Parser()
   .endianess('little')
   .uint16('magic', { assert: 0o432 })
   .uint16('names_size')
@@ -36,7 +37,7 @@ const TerminfoParser = new Parser()
         .buffer('string_table', { readUntil: 'eof' })
     }
   })
-TerminfoParser.compile()
+TermInfoParser.compile()
 
 const bool_names = {
   auto_left_margin: 0,
@@ -509,7 +510,7 @@ const string_names = {
   set_pglen_inch: 393,
 }
 
-class Terminfo {
+class TermInfo {
   constructor(terminfo_data) {
     this.terminfo_data = terminfo_data
   }
@@ -540,7 +541,7 @@ class Terminfo {
       for (const file of files_to_try) {
         try {
           const data = fs.readFileSync(file)
-          return new Terminfo(TerminfoParser.parse(data))
+          return new TermInfo(TermInfoParser.parse(data))
         } catch (e) {
           // let it go 🎶
         }
@@ -551,10 +552,285 @@ class Terminfo {
   static forCurrentTerminal() {
     return this.forTerminal(process.env['TERM'])
   }
+
+  static eval(s, ...params) {
+    const stack = []
+    let ret = ''
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c != '%') {
+        ret += c
+      } else {
+        switch (s[++i]) {
+          case '%': // literal %
+            ret += '%';
+            break;
+          case 'i': // increment the first two params
+            if (params.length > 0) params[0]++;
+            if (params.length > 1) params[1]++;
+            break;
+          case 'p': // push a param onto the stack
+            stack.push(params[s.charCodeAt(++i) - '1'.charCodeAt(0)]);
+            break;
+          case 'd': // emit a decimal-formatted number
+            {
+              const val = stack.pop()
+              ret += val;
+            }
+            break;
+          case '?': // 'if'
+            break;
+          case ';': // 'endif'
+            break;
+          case 't': // 'then'
+            {
+              const x = stack.pop()
+              if (!x) {
+                i++;
+                let level = 0;
+                while (i < s.length) {
+                  if (s[i] == '%') {
+                    i++;
+                    if (s[i] == '?')
+                      level++;
+                    else if (s[i] == ';') {
+                      if (level > 0)
+                        level--;
+                      else
+                        break;
+                    } else if (s[i] == 'e' && level == 0)
+                      break;
+                  }
+
+                  if (i < s.length)
+                    i++;
+                }
+              }
+            }
+            break;
+          case 'e': // 'else'/'else if'
+            {
+              i++;
+              let level = 0;
+              while (i < s.length) {
+                if (s[i] == '%') {
+                  i++;
+                  if (s[i] == '?')
+                    level++;
+                  else if (s[i] == ';') {
+                    if (level > 0)
+                      level--;
+                    else
+                      break;
+                  }
+                }
+                if (i < s.length)
+                  i++;
+              }
+            }
+            break;
+          case '{': // push literal number
+            {
+              const cb = s.indexOf('}', i);
+              stack.push(parseInt(s.substr(i + 1, cb - i)));
+              i = cb;
+            }
+            break;
+          case '<': // pop a, pop b, push b < a
+            {
+              const a = stack.pop()
+              const b = stack.pop()
+              stack.push(b < a ? 1 : 0);
+            }
+            break;
+          case '-': // pop a, pop b, push b - a
+            {
+              const a = stack.pop()
+              const b = stack.pop()
+              stack.push(b - a);
+            }
+            break;
+        }
+      }
+    }
+    return ret;
+  }
 }
 
-const ti = Terminfo.forCurrentTerminal()
+const wait = (ms) => {
+  const ns = BigInt(ms * 1000000)
+  const start = process.hrtime.bigint()
+  while ((process.hrtime.bigint() - start) < ns);
+}
 
-console.log(ti.terminfo_data.curses_extended)
-console.log(require('util').inspect(ti.getString('back_tab')))
-console.log(require('util').inspect(ti.getString('clr_eos')))
+class Screen extends EventEmitter {
+  constructor(terminfo) {
+    super()
+    this.terminfo = terminfo || TermInfo.forCurrentTerminal()
+    this._characters = new Map
+    this._lastCharacters = new Map
+    this._pendingFlush = null
+    this._mouseEnabled = false
+    this._cursorVisible = true
+  }
+
+  start() {
+    process.stdout.write(this.terminfo.getString('enter_ca_mode'))
+    process.stdin.setRawMode(true)
+    process.stdin.on('data', this._stdinListener = this.onStdinData.bind(this))
+  }
+
+  stop() {
+    process.stdout.write(this.terminfo.getString('exit_ca_mode'))
+    if (this._mouseEnabled) {
+      this.setMouseEnabled(false)
+    }
+    if (!this._cursorVisible) {
+      this.setCursorVisible(true)
+    }
+    process.stdin.setRawMode(false)
+    process.stdin.off('data', this._stdinListener)
+    if (this._pendingFlush) {
+      clearImmediate(this._pendingFlush)
+    }
+  }
+
+  onStdinData(e) {
+    this.emit('key', e)
+  }
+
+  put(x, y, c, opts = {}) {
+    const rx = x|0
+    const ry = y|0
+    if (c.length !== 1) {
+      for (let i = 0; i < c.length; i++) {
+        this.put(rx + i, ry, c[i], opts)
+      }
+      return
+    }
+    this._characters.set(`${rx},${ry}`, {chr: c, fg: opts.fg, bg: opts.bg})
+    this._setNeedsFlush()
+  }
+
+  clear() {
+    this._characters = new Map
+    this._setNeedsFlush()
+  }
+
+  flush() {
+    for (const [xy,] of this._lastCharacters) {
+      if (!this._characters.has(xy)) {
+        const [x, y] = xy.split(/,/)
+        process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)) + ' ')
+        wait(0.2)
+      }
+    }
+    let last_fg = null
+    let last_bg = null
+    for (const [xy, ch] of this._characters) {
+      const last = this._lastCharacters.get(xy)
+      if (!last || last.chr !== ch.chr || last.bg !== ch.bg || last.fg !== ch.fg) {
+        const [x, y] = xy.split(/,/)
+        if (ch.fg !== last_fg || ch.bg !== last_bg) {
+          process.stdout.write(this.terminfo.getString('exit_attribute_mode'))
+          if (ch.fg != null)
+            process.stdout.write(TermInfo.eval(this.terminfo.getString('set_a_foreground'), ch.fg))
+          if (ch.bg != null)
+            process.stdout.write(TermInfo.eval(this.terminfo.getString('set_a_background'), ch.bg))
+          last_fg = ch.fg
+          last_bg = ch.bg
+        }
+        process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)) + ch.chr)
+        wait(0.2)
+      }
+    }
+    this._lastCharacters = this._characters
+    this._characters = new Map(this._lastCharacters)
+    this._pendingFlush = null
+  }
+
+  _setNeedsFlush() {
+    if (this._pendingFlush == null)
+      this._pendingFlush = setImmediate(this.flush.bind(this))
+  }
+
+  setMouseEnabled(enabled) {
+    if (enabled && !this._mouseEnabled) {
+      process.stdout.write('\x1b[?1003h')
+    } else if (!enabled && this._mouseEnabled) {
+      process.stdout.write('\x1b[?1000l')
+    }
+    this._mouseEnabled = enabled
+  }
+
+  setCursorVisible(show) {
+    if (show && !this._cursorVisible) {
+      process.stdout.write(this.terminfo.getString('cursor_visible'))
+    } else if (!show && this._cursorVisible) {
+      process.stdout.write(this.terminfo.getString('cursor_invisible'))
+    }
+    this._cursorVisible = show
+  }
+}
+
+
+if (!module.parent) {
+  const ti = TermInfo.forCurrentTerminal()
+  const screen = new Screen(ti)
+  screen.setMouseEnabled(true)
+  screen.setCursorVisible(false)
+  screen.start()
+
+  let particles = []
+
+  process.stdin.on('data', (d) => {
+    if (d[0] === 3) {
+      screen.stop()
+      process.exit(0)
+    }
+    const m = /^\x1b\[M(.)(.)(.)$/.exec(d)
+    if (m) {
+      const [,,,btn, cx, cy] = d
+      const x = cx - 32 - 1
+      const y = cy - 32 - 1
+      const btnsDown = btn & 0x23
+      if (btnsDown === 32) {
+        for (let i = 0; i < 4 + Math.random() * 5; i++)  {
+          particles.push({
+            x, y,
+            vx: Math.random() * 2 - 1,
+            vy: Math.random() * 2 - 1,
+            chr: '*'
+          })
+        }
+      }
+    }
+  })
+
+  function update() {
+    const dt = 0.5
+    const [width, height] = process.stdout.getWindowSize()
+    for (const p of particles) {
+      p.x += p.vx * dt
+      p.y += p.vy * dt
+      p.vy += 0.1 * dt
+    }
+    particles = particles.filter(p => p.x >= 0 && p.x < width && p.y >= 0 && p.y < height)
+  }
+
+  function draw() {
+    screen.clear()
+    for (const p of particles) {
+      screen.put(p.x, p.y, p.chr)
+    }
+  }
+
+  function frame() {
+    update()
+    draw()
+  }
+
+  setInterval(frame, 1000/30)
+}
+
+module.exports = { TermInfo, Screen }
