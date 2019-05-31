@@ -720,12 +720,20 @@ class Screen extends EventEmitter {
     process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)))
   }
 
+  putImage(x, y, buf) {
+    this._image = {x, y, buf}
+  }
+
   clear() {
     this._characters = new Map
     this._setNeedsFlush()
   }
 
   flush() {
+    if (this._wasImage) {
+      process.stdout.write(this.terminfo.getString('clear_screen'))
+      this._wasImage = false
+    }
     for (const [xy,] of this._lastCharacters) {
       if (!this._characters.has(xy)) {
         const [x, y] = xy.split(/,/)
@@ -753,6 +761,12 @@ class Screen extends EventEmitter {
         process.stdout.write(ch.chr)
         wait(0.5)
       }
+    }
+    if (this._image) {
+      this.move(this._image.x, this._image.y)
+      process.stdout.write('\x1b]1337;File=inline=1;height=100%:' + this._image.buf.toString('base64') + '\x07')
+      this._image = null
+      this._wasImage = true
     }
     this._lastCharacters = this._characters
     this._characters = new Map(this._lastCharacters)
