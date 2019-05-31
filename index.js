@@ -708,8 +708,16 @@ class Screen extends EventEmitter {
       }
       return
     }
-    this._characters.set(`${rx},${ry}`, {chr: c, fg: opts.fg, bg: opts.bg})
-    this._setNeedsFlush()
+    if (c !== ' ' || opts.fg != null || opts.bg != null) {
+      this._characters.set(`${rx},${ry}`, {chr: c, fg: opts.fg, bg: opts.bg})
+      this._setNeedsFlush()
+    }
+  }
+
+  move(x, y) {
+    const rx = x|0
+    const ry = y|0
+    process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)))
   }
 
   clear() {
@@ -721,8 +729,9 @@ class Screen extends EventEmitter {
     for (const [xy,] of this._lastCharacters) {
       if (!this._characters.has(xy)) {
         const [x, y] = xy.split(/,/)
-        process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)) + ' ')
-        wait(0.2)
+        this.move(x, y)
+        process.stdout.write(' ')
+        wait(0.5)
       }
     }
     let last_fg = null
@@ -740,8 +749,9 @@ class Screen extends EventEmitter {
           last_fg = ch.fg
           last_bg = ch.bg
         }
-        process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)) + ch.chr)
-        wait(0.2)
+        this.move(x, y)
+        process.stdout.write(ch.chr)
+        wait(0.5)
       }
     }
     this._lastCharacters = this._characters
