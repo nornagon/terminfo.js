@@ -709,7 +709,7 @@ class Screen extends EventEmitter {
       return
     }
     if (c !== ' ' || opts.fg != null || opts.bg != null) {
-      this._characters.set(`${rx},${ry}`, {chr: c, fg: opts.fg, bg: opts.bg})
+      this._characters.set(`${rx},${ry}`, {chr: c, fg: opts.fg, bg: opts.bg, bold: opts.bold, underline: opts.underline})
       this._setNeedsFlush()
     }
   }
@@ -744,18 +744,27 @@ class Screen extends EventEmitter {
     }
     let last_fg = null
     let last_bg = null
+    let last_bold = null
+    let last_underline = null
+    process.stdout.write(this.terminfo.getString('exit_attribute_mode'))
     for (const [xy, ch] of this._characters) {
       const last = this._lastCharacters.get(xy)
-      if (!last || last.chr !== ch.chr || last.bg !== ch.bg || last.fg !== ch.fg) {
+      if (!last || last.chr !== ch.chr || last.bg !== ch.bg || last.fg !== ch.fg || last.bold !== ch.bold || last.underline !== ch.underline) {
         const [x, y] = xy.split(/,/)
-        if (ch.fg !== last_fg || ch.bg !== last_bg) {
+        if (ch.fg !== last_fg || ch.bg !== last_bg || ch.bold !== last_bold || ch.underline !== last_underline) {
           process.stdout.write(this.terminfo.getString('exit_attribute_mode'))
           if (ch.fg != null)
             process.stdout.write(TermInfo.eval(this.terminfo.getString('set_a_foreground'), ch.fg))
           if (ch.bg != null)
             process.stdout.write(TermInfo.eval(this.terminfo.getString('set_a_background'), ch.bg))
+          if (ch.bold)
+            process.stdout.write(this.terminfo.getString('enter_bold_mode'))
+          if (ch.underline)
+            process.stdout.write(this.terminfo.getString('enter_underline_mode'))
           last_fg = ch.fg
           last_bg = ch.bg
+          last_bold = ch.bold
+          last_underline = ch.underline
         }
         this.move(x, y)
         process.stdout.write(ch.chr)
