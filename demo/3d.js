@@ -49,7 +49,7 @@ function update(dt) {
   rot[2] += dt / 700
 }
 
-function draw() {
+function drawCube(screen, rot) {
   // General approach: each pair of vectors in `cube` represents a line
   // segment. For each line segment, sample several points along the segment,
   // project them into screen space, and draw the resulting point.
@@ -66,7 +66,15 @@ function draw() {
   }
 }
 
-setInterval(() => {
-  update(1000 / 30)
-  draw()
-}, 1000/30)
+function draw() {
+  drawCube(screen, rot)
+}
+
+module.exports = {drawCube}
+
+if (!module.parent) {
+  setInterval(() => {
+    update(1000 / 30)
+    draw()
+  }, 1000/30)
+}
