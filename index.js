@@ -1,12 +1,14 @@
+// @ts-check
+//
 const {Parser} = require('binary-parser')
 const {EventEmitter} = require('events')
 const fs = require('fs')
 const path = require('path')
 
-function untilEven() { return offset % 2 === 0 ? 0 : 1 }
+function untilEven({offset}) { return offset % 2 === 0 ? 0 : 1 }
 
 const TermInfoParser = new Parser()
-  .endianess('little')
+  .endianness('little')
   .uint16('magic', { assert: 0o432 })
   .uint16('names_size')
   .uint16('bools_size')
@@ -19,23 +21,25 @@ const TermInfoParser = new Parser()
   .array('ints', { type: 'uint16le', length: 'ints_size', formatter: is => is.map(i => i === 0xffff ? -1 : i) })
   .array('string_offsets', { type: 'uint16le', length: 'strings_size' })
   .buffer('string_table', { length: 'string_table_size' })
-  .choice('curses_extended', {
-    tag: function() { return offset < buffer.length ? 1 : 0 },
-    choices: {
-      1: new Parser()
-        .skip(untilEven)
-        .uint16le('bools_count')
-        .uint16le('ints_count')
-        .uint16le('strings_count')
-        .uint16le('string_table_size')
-        .uint16le('last_offset')
-        .array('bools', { type: 'uint8', length: 'bools_count', formatter: bs => bs.map(b => b === 1) })
-        .skip(untilEven)
-        .array('ints', { type: 'uint16le', length: 'ints_count', formatter: is => is.map(i => i === 0xffff ? -1 : i) })
-        .array('string_offsets', { type: 'uint16le', length: 'strings_count', formatter: is => is.map(i => i === 0xffff ? -1 : i) })
-        .array('name_offsets', { type: 'uint16le', length: function() { return this.bools_count + this.ints_count + this.strings_count } })
-        .buffer('string_table', { readUntil: 'eof' })
-    }
+  .saveOffset('offset')
+  .wrapped('curses_extended', {
+    readUntil: 'eof',
+    wrapper(buffer) { return buffer },
+    type: new Parser()
+      .skip(untilEven)
+      .uint16le('bools_count')
+      .uint16le('ints_count')
+      .uint16le('strings_count')
+      .uint16le('string_table_size')
+      .uint16le('last_offset')
+      .array('bools', { type: 'uint8', length: 'bools_count', formatter: bs => bs.map(b => b === 1) })
+      .saveOffset('offset')
+      .skip(untilEven)
+      .array('ints', { type: 'uint16le', length: 'ints_count', formatter: is => is.map(i => i === 0xffff ? -1 : i) })
+      .array('string_offsets', { type: 'uint16le', length: 'strings_count', formatter: is => is.map(i => i === 0xffff ? -1 : i) })
+      // @ts-ignore
+      .array('name_offsets', { type: 'uint16le', length: function() { return this.bools_count + this.ints_count + this.strings_count } })
+      .buffer('string_table', { readUntil: 'eof' })
   })
 TermInfoParser.compile()
 
@@ -515,14 +519,26 @@ class TermInfo {
     this.terminfo_data = terminfo_data
   }
 
+  /**
+   * @param {keyof typeof bool_names} name
+   * @returns {boolean | undefined}
+   */
   getBool(name) {
     return this.terminfo_data.bools[bool_names[name]]
   }
 
+  /**
+   * @param {keyof typeof int_names} name
+   * @returns {number | undefined}
+   */
   getInt(name) {
     return this.terminfo_data.ints[int_names[name]]
   }
 
+  /**
+   * @param {keyof typeof string_names} name
+   * @returns {string | null}
+   */
   getString(name) {
     const offset = this.terminfo_data.string_offsets[string_names[name]]
     if (offset == null)
@@ -531,6 +547,9 @@ class TermInfo {
     return buf.toString('ascii', 0, buf.indexOf(0))
   }
 
+  /**
+   * @param {string} term_name
+   */
   static forTerminal(term_name) {
     const dirs_to_search = [ '/usr/share/terminfo' ]
     for (const dir of dirs_to_search) {
@@ -543,14 +562,16 @@ class TermInfo {
           const data = fs.readFileSync(file)
           return new TermInfo(TermInfoParser.parse(data))
         } catch (e) {
+          throw e
           // let it go 🎶
         }
       }
     }
+    throw new Error(`Could not find terminfo for terminal ${term_name}`)
   }
 
   static forCurrentTerminal() {
-    return this.forTerminal(process.env['TERM'])
+    return this.forTerminal(process.env['TERM'] ?? '')
   }
 
   static eval(s, ...params) {
@@ -657,13 +678,23 @@ class TermInfo {
   }
 }
 
+/*
 const wait = (ms) => {
   const ns = BigInt(ms * 1000000)
   const start = process.hrtime.bigint()
   while ((process.hrtime.bigint() - start) < ns);
 }
+*/
 
 class Screen extends EventEmitter {
+  /**
+   * @type {TermInfo}
+   */
+  terminfo;
+
+  /**
+   * @param {TermInfo | undefined} terminfo
+   */
   constructor(terminfo) {
     super()
     this.terminfo = terminfo || TermInfo.forCurrentTerminal()
@@ -677,7 +708,7 @@ class Screen extends EventEmitter {
   start() {
     process.stdout.write(this.terminfo.getString('enter_ca_mode'))
     process.stdin.setRawMode(true)
-    process.stdin.on('data', this._stdinListener = this.onStdinData.bind(this))
+    process.stdin.on('data', this._stdinListener = this.#onStdinData.bind(this))
   }
 
   stop() {
@@ -695,10 +726,15 @@ class Screen extends EventEmitter {
     }
   }
 
-  onStdinData(e) {
+  #onStdinData(e) {
     this.emit('key', e)
   }
 
+  /**
+   * @param {number} x
+   * @param {number} y
+   * @param {string} c
+   */
   put(x, y, c, opts = {}) {
     const rx = x|0
     const ry = y|0
@@ -714,10 +750,14 @@ class Screen extends EventEmitter {
     }
   }
 
+  /**
+   * @param {string | number} x
+   * @param {string | number} y
+   */
   move(x, y) {
-    const rx = x|0
-    const ry = y|0
-    process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), parseInt(y), parseInt(x)))
+    const rx = typeof x === 'number' ? x|0 : parseInt(x)
+    const ry = typeof y === 'number' ? y|0 : parseInt(y)
+    process.stdout.write(TermInfo.eval(this.terminfo.getString('cursor_address'), ry, rx))
   }
 
   putImage(x, y, buf) {
@@ -739,7 +779,7 @@ class Screen extends EventEmitter {
         const [x, y] = xy.split(/,/)
         this.move(x, y)
         process.stdout.write(' ')
-        wait(0.5)
+        //wait(0.5)
       }
     }
     let last_fg = null
@@ -749,7 +789,7 @@ class Screen extends EventEmitter {
     process.stdout.write(this.terminfo.getString('exit_attribute_mode'))
     for (const [xy, ch] of this._characters) {
       const last = this._lastCharacters.get(xy)
-      if (!last || last.chr !== ch.chr || last.bg !== ch.bg || last.fg !== ch.fg || last.bold !== ch.bold || last.underline !== ch.underline) {
+      if (last == null || last.chr !== ch.chr || last.bg !== ch.bg || last.fg !== ch.fg || last.bold !== ch.bold || last.underline !== ch.underline) {
         const [x, y] = xy.split(/,/)
         if (ch.fg !== last_fg || ch.bg !== last_bg || ch.bold !== last_bold || ch.underline !== last_underline) {
           process.stdout.write(this.terminfo.getString('exit_attribute_mode'))
@@ -768,7 +808,7 @@ class Screen extends EventEmitter {
         }
         this.move(x, y)
         process.stdout.write(ch.chr)
-        wait(0.5)
+        //wait(0.5)
       }
     }
     if (this._image) {
@@ -787,6 +827,9 @@ class Screen extends EventEmitter {
       this._pendingFlush = setImmediate(this.flush.bind(this))
   }
 
+  /**
+   * @param {boolean} enabled
+   */
   setMouseEnabled(enabled) {
     if (enabled && !this._mouseEnabled) {
       process.stdout.write('\x1b[?1003h')
@@ -796,6 +839,9 @@ class Screen extends EventEmitter {
     this._mouseEnabled = enabled
   }
 
+  /**
+   * @param {boolean} show
+   */
   setCursorVisible(show) {
     if (show && !this._cursorVisible) {
       process.stdout.write(this.terminfo.getString('cursor_visible'))
@@ -804,66 +850,6 @@ class Screen extends EventEmitter {
     }
     this._cursorVisible = show
   }
-}
-
-
-if (!module.parent) {
-  const ti = TermInfo.forCurrentTerminal()
-  const screen = new Screen(ti)
-  screen.setMouseEnabled(true)
-  screen.setCursorVisible(false)
-  screen.start()
-
-  let particles = []
-
-  process.stdin.on('data', (d) => {
-    if (d[0] === 3) {
-      screen.stop()
-      process.exit(0)
-    }
-    const m = /^\x1b\[M(.)(.)(.)$/.exec(d)
-    if (m) {
-      const [,,,btn, cx, cy] = d
-      const x = cx - 32 - 1
-      const y = cy - 32 - 1
-      const btnsDown = btn & 0x23
-      if (btnsDown === 32) {
-        for (let i = 0; i < 4 + Math.random() * 5; i++)  {
-          particles.push({
-            x, y,
-            vx: Math.random() * 2 - 1,
-            vy: Math.random() * 2 - 1,
-            chr: '*'
-          })
-        }
-      }
-    }
-  })
-
-  function update() {
-    const dt = 0.5
-    const [width, height] = process.stdout.getWindowSize()
-    for (const p of particles) {
-      p.x += p.vx * dt
-      p.y += p.vy * dt
-      p.vy += 0.1 * dt
-    }
-    particles = particles.filter(p => p.x >= 0 && p.x < width && p.y >= 0 && p.y < height)
-  }
-
-  function draw() {
-    screen.clear()
-    for (const p of particles) {
-      screen.put(p.x, p.y, p.chr)
-    }
-  }
-
-  function frame() {
-    update()
-    draw()
-  }
-
-  setInterval(frame, 1000/30)
 }
 
 module.exports = { TermInfo, Screen }
